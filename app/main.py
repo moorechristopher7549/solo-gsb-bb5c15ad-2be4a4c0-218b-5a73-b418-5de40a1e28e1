@@ -23,6 +23,12 @@
   并实时看到各应答组的提交状态、正文与版本（定向卡仅目标组，全员卡覆盖
   现有全部组）；答复持久化，经快照与 WebSocket 恢复，参与者看不到他组
   正文；重置演练时清空答复并解除锁定
+- 现场决策投票：主持人创建 2～4 个选项、指定参与组与截止虚拟秒的投票；
+  仅指定组在截止前可提交或改投（每组只计一票）；后台 tick 在同一把
+  state_lock 内对到期投票一次性结算（最高票获胜，平票按选项创建顺序，
+  结果持久化）；暂停冻结截止计时；主持人实时看逐组选票与汇总，参与者
+  只见自己的选择、结算后才看到结果，观察者完全不可见；重置时未结算
+  投票作废、已结算结果按轮次保留
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -50,6 +56,7 @@ from pydantic import BaseModel, Field
 
 from . import db as dbmod
 from . import export as reviewmod
+from . import polls as pollmod
 
 log = logging.getLogger("inject")
 logging.basicConfig(level=logging.INFO)
@@ -352,6 +359,7 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             "room": room_public(room, include_code=False),       # 观察者拿不到房间码
             "groups": [{"id": g["id"], "name": g["name"]} for g in groups],  # 不含组加入码
             "cards": [card_public(c) for c in cards],            # 仅已揭示；无回执字段
+            # 观察者完全看不到投票（不带 polls 字段，前端视为空）
         }
     if scope is None:
         cards = db.execute(
@@ -395,6 +403,18 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             (room["id"],),
         ).fetchall()
         snapshot["anchors"] = [anchor_public(a) for a in anchors]
+        # 现场决策投票：主持人看全部轮次的投票、逐组选票与汇总（含已作废留痕）。
+        snapshot["polls"] = [
+            pollmod.host_view(db, p) for p in pollmod.host_polls(db, room["id"])
+        ]
+    else:
+        # 参与者：仅本轮且本组在参与名单内的投票；投票中只见自己的选择，
+        # 结算后才带票数与获胜选项；已作废 / 他组投票完全不下发。
+        snapshot["polls"] = [
+            v for p in pollmod.current_polls_for_group(
+                db, room["id"], current_round(room["id"]), scope)
+            if (v := pollmod.player_view(db, p, scope)) is not None
+        ]
     return snapshot
 
 
@@ -464,11 +484,17 @@ def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
 
 def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) -> bool:
     """事件是否应投递给该视野。主持人全收；参与者只收全员/本组卡片事件与房间级事件；
-    观察者只收已揭示卡片揭示/移除与房间级事件。"""
+    观察者只收已揭示卡片揭示/移除与房间级事件。
+
+    投票事件对观察者一律不可见；对参与者的进一步过滤（是否在参与名单、
+    逐组选票归属、载荷脱敏）在 project_payload 内完成。
+    """
     if scope is None:
         return True
     if type_.startswith("share_") or type_ == "gate_updated" or type_.startswith("anchor_"):
         return False  # 分享凭证、门槛编排、复盘锚点均仅主持人可见
+    if type_.startswith("poll"):
+        return not isinstance(scope, ObserverScope)  # 观察者完全看不到投票
     if isinstance(scope, ObserverScope):
         if type_ in ("card_revealed", "card_removed", "answer_lock_updated"):
             gid = payload.get("group_id")
@@ -488,6 +514,20 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
     if type_ in ("group_added", "group_removed"):
         return False
     return True  # clock / reset 等房间级事件
+
+
+def project_payload(scope: int | None, type_: str, payload: dict) -> dict | None:
+    """按视野裁剪事件载荷。返回 None = 不投递；主持人原样下发。
+
+    投票事件的主持人载荷含参与名单、每选项汇总与逐组选票；参与者版只给
+    「选项文本 + 本组选择」（结算后追加票数与获胜选项，仍无逐组选票），
+    且非参与组 / 非本组选票返回 None。
+    """
+    if scope is None:
+        return payload
+    if isinstance(scope, int) and type_.startswith("poll"):
+        return pollmod.player_event_payload(type_, payload, scope)
+    return payload
 
 
 class Hub:
@@ -513,8 +553,11 @@ class Hub:
         for ws, scope in list(self._rooms.get(code, {}).items()):
             if not event_visible(scope, type_, payload):
                 continue
+            scoped_payload = project_payload(scope, type_, payload)
+            if scoped_payload is None:
+                continue  # 投票事件：该参与组不在参与名单 / 非本组选票
             try:
-                await ws.send_json(message)
+                await ws.send_json({**message, "payload": scoped_payload})
             except Exception:
                 self.discard(code, ws)
 
@@ -593,6 +636,11 @@ async def ticker_loop() -> None:
     带回执门槛的卡片到期后先检查前置卡片回执：未集齐则继续等待；
     虚拟时钟超过 触发秒数 + 超时秒数 仍未集齐时，标记为超时揭示并继续。
     暂停期间时钟冻结，门槛计时同样不推进。
+
+    现场决策投票与卡片同一节奏结算：仅 running 房间、同一把锁内，
+    对 deadline_seconds*1000 <= 当前虚拟毫秒的 open 投票一次性结算
+    （状态翻 settled 并持久化获胜选项，天然不会重复结算）；暂停期间
+    截止计时冻结，重启后 running 房间已被安全冻结为 paused。
     """
     while True:
         await asyncio.sleep(TICK_INTERVAL)
@@ -634,6 +682,11 @@ async def ticker_loop() -> None:
                                      room["code"], card["seq"], card["title"])
                         else:
                             log.info("room %s revealed card #%s (%s)", room["code"], card["seq"], card["title"])
+                    # 到期投票在同一把锁、同一次虚拟时钟采样下一次性结算：
+                    # 只扫描 running 房间，暂停期间 elapsed 冻结、截止计时不推进。
+                    settled = pollmod.settle_due_polls(db, room["id"], elapsed, time.time())
+                    for view in settled:
+                        await publish(room["code"], room["id"], "poll_settled", view)
                 await expire_due_shares()
         except asyncio.CancelledError:
             raise
@@ -746,6 +799,14 @@ async def delete_group(code: str, group_id: int):
         ).fetchone()["c"]
         if refs:
             raise HTTPException(status_code=409, detail=f"group is targeted by {refs} card(s)")
+        # 投票的逐组选票 / 参与名单是已结算结果的一部分：任何投票引用该组时
+        # 禁止删除（历史结果按轮次保留，不能因删组而残缺），需等新一轮不再引用。
+        poll_refs = db.execute(
+            "SELECT COUNT(*) AS c FROM poll_participants WHERE group_id = ?", (group_id,)
+        ).fetchone()["c"]
+        if poll_refs:
+            raise HTTPException(status_code=409,
+                                detail=f"group participates in {poll_refs} poll(s)")
         db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
         db.commit()
         await publish(room["code"], room["id"], "group_removed", {"id": group_id})
@@ -1051,6 +1112,92 @@ async def observe_snapshot(token: str):
         return build_snapshot(room, observer_scope_from(share))
 
 
+# ---------------------------------------------------------------- REST：现场决策投票
+
+class PollIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    options: list[str] = Field(min_length=2, max_length=4)   # 2～4 个选项
+    group_ids: list[int] = Field(min_length=1)               # 指定参与组（非空）
+    deadline_seconds: int = Field(ge=0, le=24 * 3600)        # 截止虚拟秒（自演练开始起算）
+
+
+@app.post("/api/rooms/{code}/polls", status_code=201)
+async def create_poll(code: str, body: PollIn):
+    """主持人创建现场决策投票：2～4 个选项、指定参与组与截止虚拟秒。
+
+    任意房间状态（待机 / 运行 / 暂停）均可创建；截止判定走虚拟时钟——
+    待机时不会到期（tick 只结算 running 房间），暂停期间截止计时冻结。
+    创建时在 state_lock 内绑定当前轮次；重置后未结算投票作废，已结算
+    结果按行内 round 保留。每个指定组都必须属于本房间。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        option_texts: list[str] = []
+        for text in body.options:
+            text = text.strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="option text must not be empty")
+            option_texts.append(text[:200])
+        group_ids = list(dict.fromkeys(body.group_ids))  # 去重保序
+        for gid in group_ids:
+            get_group_or_404(room["id"], gid)           # 每个参与组都必须属于本房间
+        poll = pollmod.create_poll(
+            db, room["id"], current_round(room["id"]), body.title.strip(),
+            body.deadline_seconds, group_ids, option_texts, time.time(),
+        )
+        payload = pollmod.host_view(db, poll)
+        await publish(room["code"], room["id"], "poll_created", payload)
+        return payload
+
+
+class PollVoteIn(BaseModel):
+    option_id: int  # 必须属于本投票的选项；改投即携带新选项 id 再投
+
+
+@app.put("/api/join/{join_code}/polls/{poll_id}/vote")
+async def cast_poll_vote(join_code: str, poll_id: int, body: PollVoteIn):
+    """参与组提交 / 改投：每组只计一票（UNIQUE(poll_id, group_id)，改投覆盖）。
+
+    仅投票参与名单内的组可投；非本组投票对该组不可见（404，不暴露存在）；
+    仅 open 且未到截止虚拟秒前可投（已结算 / 已作废 / 已到期返回 409）；
+    option_id 必须是本投票选项（否则 404）。截止走虚拟时钟，暂停期间
+    时钟冻结、仍可改投；状态持久化，重连 / 重启后继续生效。
+    """
+    async with state_lock:
+        group = db.execute(
+            "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(status_code=404, detail="join code not found")
+        poll = pollmod.get_poll(db, poll_id)
+        if poll is None or poll["room_id"] != group["room_id"] \
+                or not pollmod.is_participant(db, poll_id, group["id"]):
+            raise HTTPException(status_code=404, detail="poll not found")
+        if poll["status"] != pollmod.POLL_OPEN:
+            raise HTTPException(status_code=409,
+                                detail={"error": "poll_not_open", "status": poll["status"]})
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        if poll["deadline_seconds"] * 1000 <= room_elapsed_ms(room):
+            # 到点但本 tick 尚未结算：视为截止，等 tick 一次性结算，不接受写入
+            raise HTTPException(status_code=409, detail={"error": "poll_deadline_passed"})
+        option = db.execute(
+            "SELECT id FROM poll_options WHERE id = ? AND poll_id = ?",
+            (body.option_id, poll_id),
+        ).fetchone()
+        if option is None:
+            raise HTTPException(status_code=404, detail="option not found")
+        vote = pollmod.cast_vote(db, poll, group["id"], body.option_id, time.time())
+        # 主持人载荷含逐组选票；广播投影后只有主持人与本组参与者会收到
+        payload = {
+            "poll_id": poll_id,
+            "ballot": {"group_id": group["id"], "option_id": vote["option_id"],
+                       "updated_at": vote["updated_at"]},
+        }
+        await publish(room["code"], room["id"], "poll_voted", payload)
+        return {"poll_id": poll_id, "my_option_id": vote["option_id"],
+                "updated_at": vote["updated_at"]}
+
+
 # ---------------------------------------------------------------- REST：复盘锚点
 
 class AnchorIn(BaseModel):
@@ -1241,6 +1388,8 @@ async def reset_room(code: str):
     回执随揭示一并收回：未揭示卡片不可回执，新一轮演练从零开始统计；
     门槛超时标记同时清零，门槛回到等待状态；
     处置答复一并清空并解除全部锁定，新一轮演练从零开始作答。
+    现场决策投票：结算前（open）的投票整批判废（选票留痕备查，不下发参与者），
+    已结算结果按行内轮次保留；参与者侧由 reset 事件清空本轮全部投票视图。
     """
     async with state_lock:
         room = get_room_or_404(code)
@@ -1257,11 +1406,16 @@ async def reset_room(code: str):
         )
         db.execute("DELETE FROM receipts WHERE room_id = ?", (room["id"],))
         db.execute("DELETE FROM answers WHERE room_id = ?", (room["id"],))
+        void_ids = pollmod.void_open_polls(db, room["id"])  # 未结算投票作废；已结算结果保留
         # 注意：anchors 表不在清理之列——复盘锚点跨重置保留，
         # 并以行内 round 归属原轮次（当前轮次已由本 reset 事件 +1）。
         db.commit()
         payload = {"action": "reset", "status": "idle", "elapsed_ms": 0}
         await publish(room["code"], room["id"], "reset", payload)
+        # 投票作废随 reset 同步：主持人据 void_poll_ids 就地翻状态，
+        # 参与者投影为空载荷、清空本轮投票（旧轮次投票本就不下发）。
+        await publish(room["code"], room["id"], "polls_reset",
+                      {"void_poll_ids": void_ids})
         await publish_room_gate_refresh(room)  # 回执已清空，门槛回到等待
         return payload
 

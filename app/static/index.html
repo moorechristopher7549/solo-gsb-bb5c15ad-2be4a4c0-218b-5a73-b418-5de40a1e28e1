@@ -121,6 +121,33 @@
       </form>
     </section>
 
+    <!-- 现场决策投票 -->
+    <section class="panel" id="polls-section">
+      <h2>现场决策投票</h2>
+      <div id="poll-host-controls">
+        <p class="hint">创建 <strong>2～4 个选项</strong>、勾选参与组并设置<strong>截止虚拟秒</strong>的投票。
+          只有被勾选的参与组能在截止前投票或改投，<strong>每组只计一票</strong>；截止走虚拟时钟——
+          暂停期间计时冻结，重连、重启后状态不丢。主持人实时看到逐组选票与汇总；
+          参与者只看到自己的选择，<strong>结算后</strong>才能看到结果，观察者完全不可见。
+          「重置」时未结算投票作废，已结算结果按轮次保留。</p>
+        <form id="poll-form">
+          <input id="poll-title" type="text" placeholder="投票议题，如：是否立即切流？" maxlength="200" required>
+          <div id="poll-option-rows" class="poll-option-rows"></div>
+          <button type="button" id="poll-add-option" class="group-op">＋ 增加选项</button>
+          <div id="poll-groups" class="share-groups" title="可参与投票的组"></div>
+          <div class="form-row">
+            <input id="poll-deadline" type="number" min="0" max="86400" step="1"
+                   placeholder="截止虚拟秒（自演练开始起算）" required
+                   title="相对演练开始的虚拟秒数；暂停期间截止计时冻结">
+            <button type="submit" class="primary">发起投票</button>
+          </div>
+          <p id="poll-form-hint" class="hint"></p>
+        </form>
+      </div>
+      <p id="polls-empty" class="hint">暂无可参与的投票</p>
+      <ul id="poll-list" class="poll-list"></ul>
+    </section>
+
     <!-- 卡片列表 -->
     <section class="panel">
       <h2 id="cards-title">注入卡片</h2>
