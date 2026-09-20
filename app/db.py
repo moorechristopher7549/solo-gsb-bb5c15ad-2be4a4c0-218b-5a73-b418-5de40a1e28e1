@@ -1,0 +1,186 @@
+"""SQLite 存储层：连接、建表、启动时初始化。
+
+数据库文件路径由环境变量 DATABASE_PATH 指定，默认 /data/inject.db。
+所有写操作都在 app.main 的 state_lock 下执行（单事件循环内），
+因此这里使用单连接即可。
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+DB_PATH = os.environ.get("DATABASE_PATH", "/data/inject.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS rooms (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    code           TEXT NOT NULL UNIQUE,
+    name           TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'idle',      -- idle | running | paused
+    elapsed_ms     INTEGER NOT NULL DEFAULT 0,        -- 已累计的虚拟时钟毫秒（暂停时冻结值）
+    last_resume_at REAL,                              -- 最近一次进入 running 的墙钟时间（秒）
+    created_at     REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    join_code  TEXT NOT NULL UNIQUE,                  -- 参与者入场凭证，与房间码同一命名空间
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cards (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id         INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,                 -- 房间内稳定序号，揭示次序的决胜键
+    trigger_seconds INTEGER NOT NULL,                 -- 相对演练开始的触发秒数
+    title           TEXT NOT NULL,
+    content         TEXT NOT NULL DEFAULT '',
+    group_id        INTEGER REFERENCES groups(id),    -- NULL = 全员；否则仅该参与组可见
+    revealed        INTEGER NOT NULL DEFAULT 0,
+    revealed_at_ms  INTEGER,                          -- 揭示时的虚拟时钟毫秒
+    depends_on_card_id  INTEGER REFERENCES cards(id), -- 回执门槛：前置卡片；NULL = 无门槛
+    gate_timeout_seconds INTEGER,                     -- 虚拟时钟超时秒数（自触发时刻起算）；NULL = 不设超时
+    timed_out       INTEGER NOT NULL DEFAULT 0,       -- 1 = 因门槛超时而被揭示
+    answers_locked  INTEGER NOT NULL DEFAULT 0,       -- 1 = 主持人已锁定本卡处置答复（参与者只读）
+    UNIQUE (room_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,     -- 全局单调递增事件 ID
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL,                         -- JSON
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS receipts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    card_id    INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    UNIQUE (card_id, group_id)                        -- 同一参与组对同一卡片仅保留一条回执
+);
+
+CREATE TABLE IF NOT EXISTS answers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    card_id    INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    body       TEXT NOT NULL DEFAULT '',
+    revision   INTEGER NOT NULL DEFAULT 1,            -- 乐观并发版本号，每次修改 +1
+    updated_at REAL NOT NULL,
+    UNIQUE (card_id, group_id)                        -- 同一参与组对同一卡片仅保留一份答复
+);
+
+CREATE TABLE IF NOT EXISTS observer_shares (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id          INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    token            TEXT NOT NULL UNIQUE,          -- 随机观察凭证（URL 安全，不可猜）
+    group_ids        TEXT NOT NULL,                 -- JSON 数组：1~3 个参与组 id
+    expires_at       REAL NOT NULL,                 -- 墙钟到期时刻（秒），到期即失效
+    revoked          INTEGER NOT NULL DEFAULT 0,    -- 主持人撤销标记，撤销即失效
+    expired_notified INTEGER NOT NULL DEFAULT 0,    -- ticker 是否已广播到期并断开连接
+    created_at       REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS anchors (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    title      TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    round      INTEGER NOT NULL,                  -- 记录时绑定的轮次（= 此前 reset 事件数）
+    vtime_ms   INTEGER NOT NULL,                  -- 记录时绑定的虚拟时钟毫秒（暂停取冻结值）
+    event_id   INTEGER NOT NULL,                  -- 绑定的事件水位：创建事件落库前的 MAX(events.id)，离线回放截断到此
+    created_event_id INTEGER NOT NULL,            -- 其自身 anchor_created 事件 id；导出按它做水位截断
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
+CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_cards_gate ON cards(depends_on_card_id);
+CREATE INDEX IF NOT EXISTS idx_groups_room ON groups(room_id);
+CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);
+CREATE INDEX IF NOT EXISTS idx_receipts_room ON receipts(room_id, card_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_group ON receipts(group_id);
+CREATE INDEX IF NOT EXISTS idx_answers_room ON answers(room_id, card_id);
+CREATE INDEX IF NOT EXISTS idx_observer_shares_room ON observer_shares(room_id);
+CREATE INDEX IF NOT EXISTS idx_anchors_room ON anchors(room_id, round, vtime_ms, id);
+"""
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库就地升级：cards 表补缺列。
+
+    - group_id：既有卡片一律视为全员；
+    - depends_on_card_id / gate_timeout_seconds / timed_out：回执门槛，
+      既有卡片一律视为无门槛；
+    - answers_locked：处置答复锁定，既有卡片一律视为未锁定。
+
+    必须在 executescript(SCHEMA) 之前执行：SCHEMA 里的 idx_cards_group、
+    idx_cards_gate 索引依赖这些列，旧库需先补列才能建索引。
+
+    复盘锚点表 anchors 为全新表（answers / observer_shares 同款），由
+    SCHEMA 中的 CREATE TABLE IF NOT EXISTS 直接在旧库补齐，无需额外迁移；
+    旧库既有演练视为没有任何锚点。重置不删锚点，升级后锚点仍按所属轮次保留。
+    """
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+    ).fetchone()
+    if table is None:
+        return  # 全新库：由 SCHEMA 一并建好，无需迁移
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(cards)")}
+    # 下列列在 SCHEMA 建索引（idx_cards_due 等）时必须已存在，旧库先补齐。
+    # 最早版本的 cards 表只有 id/room_id/seq/trigger_seconds/title/content，
+    # revealed/revealed_at_ms 与 group_id 等都是后续演进加入的。
+    if "revealed" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN revealed INTEGER NOT NULL DEFAULT 0")
+    if "revealed_at_ms" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN revealed_at_ms INTEGER")
+    if "group_id" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN group_id INTEGER REFERENCES groups(id)")
+    if "depends_on_card_id" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN depends_on_card_id INTEGER REFERENCES cards(id)")
+    if "gate_timeout_seconds" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN gate_timeout_seconds INTEGER")
+    if "timed_out" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN timed_out INTEGER NOT NULL DEFAULT 0")
+    if "answers_locked" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN answers_locked INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+
+def connect() -> sqlite3.Connection:
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    """建表，并把进程停止时仍处于 running 的房间安全冻结为 paused。
+
+    虚拟时钟在暂停时不推进：重启后这些房间保持暂停，已流逝时间按
+    停机前的墙钟差结算进 elapsed_ms，不会丢失也不会偷偷前进。
+    """
+    _migrate(conn)
+    conn.executescript(SCHEMA)
+    now = time.time()
+    rows = conn.execute("SELECT * FROM rooms WHERE status = 'running'").fetchall()
+    for row in rows:
+        elapsed = row["elapsed_ms"]
+        if row["last_resume_at"] is not None:
+            elapsed += int((now - row["last_resume_at"]) * 1000)
+        conn.execute(
+            "UPDATE rooms SET status = 'paused', elapsed_ms = ?, last_resume_at = NULL WHERE id = ?",
+            (max(0, elapsed), row["id"]),
+        )
+    conn.commit()
