@@ -97,6 +97,30 @@
       <p id="shares-empty" class="hint">暂无观察分享</p>
       <ul id="share-list" class="share-list"></ul>
 
+      <h3>发起现场决策投票</h3>
+      <p class="hint">填写问题与 <strong>2～4 个选项</strong>（选项顺序即平票决胜顺序），勾选参与组
+        并设置<strong>截止虚拟秒</strong>（相对本轮开始）。仅勾选组可见并可在截止前投票 / 改投，
+        每组只计一票；到点由服务端在状态锁内一次性结算，结果持久化。重置时未结算投票作废，
+        已结算结果按轮次保留。</p>
+      <form id="poll-form">
+        <input id="poll-question" type="text" placeholder="投票问题，如：是否立即切流到备用库？"
+               required maxlength="200">
+        <div id="poll-options" class="poll-options">
+          <input class="poll-option" type="text" placeholder="选项 1" required maxlength="200">
+          <input class="poll-option" type="text" placeholder="选项 2" required maxlength="200">
+        </div>
+        <div class="poll-form-row">
+          <button type="button" id="poll-add-option" class="group-op">+ 选项</button>
+          <span class="hint">最多 4 个选项</span>
+        </div>
+        <div id="poll-groups" class="share-groups"></div>
+        <div class="share-form-row">
+          <input id="poll-deadline" type="number" min="1" max="86400" step="1"
+                 placeholder="截止虚拟秒" required title="截止虚拟秒（相对本轮开始，暂停冻结）">
+          <button type="submit" class="primary">发起投票</button>
+        </div>
+      </form>
+
       <h3>添加注入卡片</h3>
       <form id="card-form">
         <div class="form-row">
@@ -126,6 +150,16 @@
       <h2 id="cards-title">注入卡片</h2>
       <p id="cards-empty" class="hint">暂无卡片</p>
       <ul id="card-list" class="card-list"></ul>
+    </section>
+
+    <!-- 现场决策投票（主持人管理；参与者投票/看结果；观察者不可见） -->
+    <section id="polls-panel" class="panel hidden">
+      <h2>现场决策投票</h2>
+      <p class="hint">截止时间走<strong>虚拟时钟</strong>：暂停即冻结，重连与重启后状态恢复。
+        只有指定参与组能在截止前投票或改投，每组只计一票；结算前参与者只见自己的选择，
+        <strong>到期结算后</strong>才能看到结果（最高票获胜，平票按选项顺序决定）。</p>
+      <p id="polls-empty" class="hint">暂无投票</p>
+      <ul id="poll-list" class="poll-list"></ul>
     </section>
   </main>
 

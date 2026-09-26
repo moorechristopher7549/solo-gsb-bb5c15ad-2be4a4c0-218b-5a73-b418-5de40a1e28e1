@@ -31,6 +31,7 @@ const state = {
   groups: [],      // 主持人：全部参与组；参与者：仅本组；观察者：分享所选组
   shares: [],      // 主持人：全部观察分享（有效/失效）
   anchors: [],     // 主持人：全部轮次的复盘锚点（参与者/观察者永远为空）
+  polls: [],       // 主持人：全部轮次投票；参与者：本轮本组投票；观察者：永远为空
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
   lastEventId: 0,
@@ -52,6 +53,8 @@ function showRoom() {
   $('#view-landing').classList.add('hidden');
   $('#view-room').classList.remove('hidden');
   $('#host-console').classList.toggle('hidden', state.role !== 'host');
+  // 现场决策投票对观察者完全不可见；主持人与参与者共用列表面板（内容按角色渲染）
+  $('#polls-panel').classList.toggle('hidden', state.role === 'observer');
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -191,6 +194,24 @@ function renderGroups() {
     label.appendChild(cb);
     label.appendChild(document.createTextNode(g.name));
     sg.appendChild(label);
+  }
+
+  // 投票表单的组复选框（至少 1 个、至多全部组）；尽量保留已勾选项
+  const pollChecked = new Set(
+    [...document.querySelectorAll('#poll-groups input:checked')].map((el) => el.value)
+  );
+  const pg = $('#poll-groups');
+  pg.innerHTML = '';
+  for (const g of state.groups) {
+    const label = document.createElement('label');
+    label.className = 'share-group-chip';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = String(g.id);
+    cb.checked = pollChecked.has(String(g.id));
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(g.name));
+    pg.appendChild(label);
   }
 }
 
@@ -697,12 +718,185 @@ function currentRound() {
   return state.round;
 }
 
+/* ---------------------------------------------------------- 现场决策投票 */
+
+/* 当前虚拟毫秒：以快照/事件同步点为基准，running 时本地外推，暂停即冻结。
+   投票截止点是虚拟毫秒，倒计时与「已到期待结算」判定都走同一口径。 */
+function currentElapsedMs() {
+  const c = state.clock;
+  return c.status === 'running'
+    ? c.elapsedMs + (performance.now() - c.syncedAt)
+    : c.elapsedMs;
+}
+
+function deadlineText(poll) {
+  const remainMs = poll.deadline_ms - currentElapsedMs();
+  if (poll.status === 'settled') return `已结算 · T+${fmt(poll.settled_at_ms || poll.deadline_ms)}`;
+  if (poll.status === 'voided') return '已作废（重置时未结算）';
+  return remainMs > 0 ? `截止 T+${fmt(poll.deadline_ms)}（剩余 ${fmt(remainMs)}）`
+    : '已到截止点，等待结算…';
+}
+
+/* 投票列表：主持人看全部轮次（历史轮标记），参与者只看本轮本组投票 */
+function renderPolls() {
+  if (state.role === 'observer') return;
+  const list = $('#poll-list');
+  list.innerHTML = '';
+  const ordered = [...state.polls].sort(
+    (a, b) => a.round - b.round || a.id - b.id);
+  $('#polls-empty').classList.toggle('hidden', ordered.length > 0);
+  for (const poll of ordered) {
+    list.appendChild(state.role === 'host' ? hostPollItem(poll) : playerPollItem(poll));
+  }
+}
+
+/* 主持人视角：问题、轮次、截止/状态、选项汇总、逐组选票 */
+function hostPollItem(poll) {
+  const li = document.createElement('li');
+  li.className = `poll-item poll-${poll.status}` +
+    (poll.round < currentRound() ? ' is-old' : '');
+
+  const head = document.createElement('div');
+  head.className = 'poll-head';
+  const q = document.createElement('span');
+  q.className = 'poll-question';
+  q.textContent = `🗳️ ${poll.question}`;
+  head.appendChild(q);
+  const tags = document.createElement('span');
+  tags.className = 'poll-tags';
+  if (poll.round < currentRound()) {
+    const rt = document.createElement('span');
+    rt.className = 'anchor-round-tag';
+    rt.textContent = `第 ${poll.round + 1} 轮（历史）`;
+    tags.appendChild(rt);
+  }
+  const st = document.createElement('span');
+  st.className = 'badge ' + (poll.status === 'settled' ? 'badge-revealed'
+    : poll.status === 'voided' ? 'share-status-revoked' : 'badge-pending');
+  st.textContent = poll.status === 'settled' ? '已结算'
+    : poll.status === 'voided' ? '已作废' : '投票中';
+  tags.appendChild(st);
+  head.appendChild(tags);
+  li.appendChild(head);
+
+  const meta = document.createElement('div');
+  meta.className = 'poll-meta';
+  const groups = (poll.group_ids || []).map(groupName).join('、') || '—';
+  meta.textContent = `参与组：${groups} · ${deadlineText(poll)}`;
+  li.appendChild(meta);
+
+  // 选项与票数：投票中实时变化（每组只计一票，改投自动迁移）
+  const tallies = poll.tallies || poll.options.map((o) => ({ option_id: o.id, count: 0 }));
+  for (const opt of poll.options) {
+    const row = document.createElement('div');
+    row.className = 'poll-option-row';
+    const n = (tallies.find((t) => t.option_id === opt.id) || {}).count || 0;
+    const winner = poll.status === 'settled' && opt.id === poll.winner_option_id;
+    row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n} 票`;
+    if (winner) row.classList.add('poll-winner');
+    li.appendChild(row);
+  }
+
+  if (poll.status === 'open') {
+    // 逐组选票：哪一组投了哪个选项；未投组也列出
+    const detail = document.createElement('div');
+    detail.className = 'poll-votes-detail';
+    const byGroup = new Map((poll.votes || []).map((v) => [v.group_id, v.option_id]));
+    for (const gid of poll.group_ids || []) {
+      const oid = byGroup.get(gid);
+      const chip = document.createElement('span');
+      chip.className = 'receipt-chip ' + (oid == null ? 'receipt-wait' : 'receipt-ok');
+      chip.textContent = oid == null
+        ? `未投票 · ${groupName(gid)}`
+        : `✓ ${groupName(gid)} → ${optionText(poll, oid)}`;
+      detail.appendChild(chip);
+    }
+    li.appendChild(detail);
+  }
+  return li;
+}
+
+function optionText(poll, optionId) {
+  const o = poll.options.find((x) => x.id === optionId);
+  return o ? o.text : `#${optionId}`;
+}
+
+/* 参与者视角：结算前只能投票/改投、只见自己的选择；结算后才显示结果与汇总 */
+function playerPollItem(poll) {
+  const li = document.createElement('li');
+  li.className = `poll-item poll-${poll.status}`;
+
+  const head = document.createElement('div');
+  head.className = 'poll-head';
+  const q = document.createElement('span');
+  q.className = 'poll-question';
+  q.textContent = `🗳️ ${poll.question}`;
+  head.appendChild(q);
+  const st = document.createElement('span');
+  st.className = 'badge ' + (poll.status === 'settled' ? 'badge-revealed'
+    : poll.status === 'voided' ? 'share-status-revoked' : 'badge-pending');
+  st.textContent = poll.status === 'settled' ? '已结算'
+    : poll.status === 'voided' ? '已作废' : '投票中';
+  head.appendChild(st);
+  li.appendChild(head);
+
+  const meta = document.createElement('div');
+  meta.className = 'poll-meta';
+  meta.textContent = deadlineText(poll);
+  li.appendChild(meta);
+
+  // 结算前不显示任何票数（包括自己选项的总票数），只呈现本组的选择
+  const pastDue = poll.status === 'open' && currentElapsedMs() >= poll.deadline_ms;
+  for (const opt of poll.options) {
+    const row = document.createElement('div');
+    row.className = 'poll-option-row';
+    const mine = poll.my_option_id === opt.id;
+    if (poll.status === 'open') {
+      const btn = document.createElement('button');
+      btn.className = 'poll-vote-btn' + (mine ? ' chosen' : '');
+      btn.textContent = (mine ? '● ' : '○ ') + opt.text;
+      btn.disabled = pastDue;
+      btn.title = pastDue ? '已到截止点，等待结算' : (mine ? '再次点击仍为改投到本项' : '投票 / 改投到本项');
+      btn.onclick = () => submitPollVote(poll, opt.id, btn);
+      row.appendChild(btn);
+    } else if (poll.status === 'settled') {
+      const n = (poll.tallies || []).find((t) => t.option_id === opt.id);
+      const winner = opt.id === poll.winner_option_id;
+      if (winner) row.classList.add('poll-winner');
+      row.textContent = `${winner ? '🏆 ' : ''}${opt.text}　${n ? n.count : 0} 票`
+        + (mine ? '（本组选择）' : '');
+    } else {
+      row.textContent = opt.text;
+    }
+    li.appendChild(row);
+  }
+  if (poll.status === 'open' && pastDue) {
+    const note = document.createElement('div');
+    note.className = 'poll-meta';
+    note.textContent = '已截止，正在等待主持人端时钟结算…';
+    li.appendChild(note);
+  }
+  return li;
+}
+
+/* 提交/改投（每组只计一票，服务端原地更新）；成功由 poll_vote_updated 事件统一刷新 */
+async function submitPollVote(poll, optionId, btn) {
+  btn.disabled = true;
+  try {
+    await api('PUT', `/api/join/${state.code}/polls/${poll.id}/vote`, { option_id: optionId });
+  } catch (err) {
+    showError(err);
+    renderPolls();
+  }
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
   renderGateOptions();
   renderShares();
   renderAnchors();
+  renderPolls();
   renderCards();
 }
 
@@ -713,7 +907,25 @@ setInterval(() => {
   const elapsed = c.status === 'running' ? c.elapsedMs + (performance.now() - c.syncedAt) : c.elapsedMs;
   $('#clock').textContent = fmt(elapsed);
   if (state.role === 'host') updateShareCountdowns();
+  updatePollCountdowns();
 }, 200);
+
+/* 投票截止倒计时就地更新（不重建列表，避免打断点击）；
+   open→到点、到点→结算 的翻转由整体重渲染处理 */
+function updatePollCountdowns() {
+  if (state.role === 'observer' || !state.polls.length) return;
+  const elapsed = currentElapsedMs();
+  let needRender = false;
+  for (const p of state.polls) {
+    if (p.status !== 'open') continue;
+    const flipKey = p.deadline_ms <= elapsed ? 1 : 0;
+    if (p._pastDueKey !== flipKey) {
+      p._pastDueKey = flipKey;
+      needRender = true; // 到点瞬间需禁用按钮/显示「等待结算」
+    }
+  }
+  if (needRender) renderPolls();
+}
 
 function syncClock(status, elapsedMs) {
   state.status = status;
@@ -728,6 +940,10 @@ function applySnapshot(msg) {
   state.groups = msg.groups || [];
   state.shares = msg.shares || []; // 仅主持人快照携带
   state.anchors = msg.anchors || []; // 仅主持人快照携带；参与者/观察者字段缺省
+  state.polls = msg.polls || [];  // 主持人全部轮次；参与者本轮本组；观察者缺省为空
+  state.polls.forEach((p) => {
+    p._pastDueKey = p.status === 'open' && p.deadline_ms <= msg.room.elapsed_ms ? 1 : 0;
+  });
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
   state.round = Number.isInteger(msg.round) ? msg.round : 0;
   state.lastEventId = msg.last_event_id; // 权威水位
@@ -852,6 +1068,38 @@ function applyEvent(msg) {
     case 'anchor_deleted':
       state.anchors = state.anchors.filter((a) => a.id !== p.id);
       break;
+    case 'poll_created':
+      // 主持人收全量，参与者收脱敏 open 载荷（服务端已按白名单过滤）
+      if (!state.polls.some((x) => x.id === p.id)) {
+        p._pastDueKey = p.status === 'open' && p.deadline_ms <= currentElapsedMs() ? 1 : 0;
+        state.polls.push(p);
+      }
+      break;
+    case 'poll_vote_updated': {
+      // 主持人载荷带完整 poll（逐组选票）；参与者本组只收三字段，更新 my_option_id
+      const poll = state.polls.find((x) => x.id === p.poll_id);
+      if (state.role === 'host' && p.poll) {
+        const i = state.polls.findIndex((x) => x.id === p.poll_id);
+        if (i >= 0) state.polls[i] = { ...state.polls[i], ...p.poll };
+      } else if (state.role === 'player' && poll) {
+        poll.my_option_id = p.option_id; // 本组投票/改投（含同组其他窗口）
+      }
+      break;
+    }
+    case 'poll_settled': {
+      // 主持人收全量（含 winner/tallies/votes），参与者收到按组脱敏的结果载荷
+      const i = state.polls.findIndex((x) => x.id === p.id);
+      if (i >= 0) state.polls[i] = { ...state.polls[i], ...p };
+      else if (state.role === 'host') state.polls.push(p);
+      break;
+    }
+    case 'poll_voided':
+      // 仅主持人收到：标记历史未结算投票为作废
+      if (state.role === 'host') {
+        const poll = state.polls.find((x) => x.id === p.id);
+        if (poll) poll.status = 'voided';
+      }
+      break;
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -866,6 +1114,9 @@ function applyEvent(msg) {
         if ('my_answer' in c) c.my_answer = null;
         c._answerWarn = false;
       });
+      // 投票：参与者清空本轮投票（作废投票与旧轮结果均不再下发）；
+      // 主持人保留全部——未结算投票随后由 poll_voided 标为作废，已结算按轮次保留
+      if (state.role !== 'host') state.polls = [];
       state.round += 1; // 重置开启新一轮；锚点不清空，旧锚点仍归属原轮次
       syncClock('idle', 0);
       break;
@@ -958,6 +1209,7 @@ function enterRoom(code, role) {
   state.groups = [];
   state.shares = [];
   state.anchors = [];
+  state.polls = [];
   state.round = 0;
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
@@ -976,6 +1228,7 @@ function enterObserver(token) {
   state.groups = [];
   state.shares = [];
   state.anchors = [];
+  state.polls = [];
   state.round = 0;
   state.groupId = null;
   location.hash = `#/observe/${token}`;
@@ -1133,6 +1386,68 @@ $('#share-form').onsubmit = async (e) => {
     document.querySelectorAll('#share-groups input:checked').forEach((el) => { el.checked = false; });
     $('#share-minutes').value = 30;
   } catch (err) { showError(err); }
+};
+
+/* 选项条数 2～4：动态增减投票选项输入框 */
+$('#poll-add-option').onclick = () => {
+  const box = $('#poll-options');
+  if (box.children.length >= 4) {
+    showError(new Error('最多 4 个选项'));
+    return;
+  }
+  const input = document.createElement('input');
+  input.className = 'poll-option';
+  input.type = 'text';
+  input.placeholder = `选项 ${box.children.length + 1}`;
+  input.required = true;
+  input.maxLength = 200;
+  box.appendChild(input);
+  input.focus();
+};
+
+$('#poll-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const question = $('#poll-question').value.trim();
+  const options = [...document.querySelectorAll('#poll-options .poll-option')]
+    .map((el) => el.value.trim())
+    .filter((s) => s.length > 0);
+  const groupIds = [...document.querySelectorAll('#poll-groups input:checked')]
+    .map((el) => parseInt(el.value, 10));
+  const deadline = parseInt($('#poll-deadline').value, 10);
+  if (!question) return;
+  if (options.length < 2 || options.length > 4) {
+    showError(new Error('请填写 2～4 个非空选项'));
+    return;
+  }
+  if (new Set(options).size !== options.length) {
+    showError(new Error('选项文本不能重复'));
+    return;
+  }
+  if (groupIds.length < 1) {
+    showError(new Error('请至少勾选一个参与组'));
+    return;
+  }
+  if (!Number.isInteger(deadline) || deadline < 1 || deadline > 86400) {
+    showError(new Error('截止虚拟秒须为 1～86400'));
+    return;
+  }
+  const btn = $('#poll-form').querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await api('POST', `/api/rooms/${state.code}/polls`, {
+      question, options, group_ids: groupIds, deadline_seconds: deadline,
+    });
+    $('#poll-question').value = '';
+    document.querySelectorAll('#poll-options .poll-option').forEach((el, i) => {
+      if (i < 2) el.value = '';
+      else el.remove();
+    });
+    document.querySelectorAll('#poll-groups input:checked').forEach((el) => { el.checked = false; });
+    $('#poll-deadline').value = '';
+    $('#poll-question').focus();
+  } catch (err) { showError(err); } finally {
+    btn.disabled = false;
+  }
 };
 
 /* 刷新恢复：根据 hash 与本地角色记录重进房间（走完整的快照+增量协议）；

@@ -102,6 +102,44 @@ CREATE TABLE IF NOT EXISTS anchors (
     updated_at REAL NOT NULL
 );
 
+-- 现场决策投票：每条投票归属创建时轮次；重置只作废未结算投票，已结算结果按轮次保留。
+CREATE TABLE IF NOT EXISTS polls (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id       INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    question      TEXT NOT NULL,
+    round         INTEGER NOT NULL,                  -- 创建时轮次（= 此前 reset 事件数）
+    deadline_ms   INTEGER NOT NULL,                  -- 截止虚拟毫秒（相对本轮开始），暂停冻结
+    status        TEXT NOT NULL DEFAULT 'open',      -- open | settled | voided
+    winner_option_id INTEGER,                        -- 结算获胜选项；平票按选项创建顺序（seq 最小）
+    settled_at_ms INTEGER,                           -- 结算时的虚拟时钟毫秒
+    created_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS poll_options (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL,                        -- 选项创建顺序：平票决胜键
+    text    TEXT NOT NULL,
+    UNIQUE (poll_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS poll_groups (
+    poll_id  INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (poll_id, group_id)                  -- 仅指定参与组可投票/可见
+);
+
+CREATE TABLE IF NOT EXISTS poll_votes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    poll_id    INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    option_id  INTEGER NOT NULL REFERENCES poll_options(id) ON DELETE CASCADE,
+    round      INTEGER NOT NULL,                     -- 投票时轮次：结算统计只数本轮票
+    updated_at REAL NOT NULL,
+    UNIQUE (poll_id, group_id)                       -- 每组只计一票，改投即原地更新
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_cards_gate ON cards(depends_on_card_id);
@@ -112,6 +150,9 @@ CREATE INDEX IF NOT EXISTS idx_receipts_group ON receipts(group_id);
 CREATE INDEX IF NOT EXISTS idx_answers_room ON answers(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_observer_shares_room ON observer_shares(room_id);
 CREATE INDEX IF NOT EXISTS idx_anchors_room ON anchors(room_id, round, vtime_ms, id);
+CREATE INDEX IF NOT EXISTS idx_polls_room ON polls(room_id, round, status);
+CREATE INDEX IF NOT EXISTS idx_poll_groups_group ON poll_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(poll_id, group_id);
 """
 
 
@@ -126,9 +167,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     必须在 executescript(SCHEMA) 之前执行：SCHEMA 里的 idx_cards_group、
     idx_cards_gate 索引依赖这些列，旧库需先补列才能建索引。
 
-    复盘锚点表 anchors 为全新表（answers / observer_shares 同款），由
+    复盘锚点表 anchors 与现场决策投票表 polls/poll_options/poll_groups/
+    poll_votes 均为全新表（answers / observer_shares 同款），由
     SCHEMA 中的 CREATE TABLE IF NOT EXISTS 直接在旧库补齐，无需额外迁移；
-    旧库既有演练视为没有任何锚点。重置不删锚点，升级后锚点仍按所属轮次保留。
+    旧库既有演练视为没有任何锚点与投票。重置不删锚点与已结算投票，
+    升级后仍按所属轮次保留。
     """
     table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cards'"

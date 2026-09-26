@@ -376,3 +376,72 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-weight: 400;
 }
 .anchor-op.anchor-del { color: var(--red); }
+
+/* ---------------------------------------------------------- 现场决策投票 */
+
+.poll-list { list-style: none; margin: 6px 0 4px; padding: 0; }
+.poll-item {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.poll-item.poll-settled { border-left-color: var(--green); }
+.poll-item.poll-voided  { border-left-color: var(--muted); opacity: .8; }
+.poll-item.is-old { opacity: .85; }
+.poll-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.poll-question { font-weight: 700; font-size: 14px; flex: 1; min-width: 0; }
+.poll-tags { display: flex; gap: 6px; align-items: center; }
+.poll-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+.poll-options { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.poll-form-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+}
+.poll-option-row {
+  margin-top: 4px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.poll-option-row.poll-winner { color: var(--green); font-weight: 700; }
+.poll-vote-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  text-align: left;
+  width: 100%;
+}
+.poll-vote-btn:hover:not(:disabled) { border-color: var(--accent); }
+.poll-vote-btn.chosen {
+  border-color: var(--green);
+  background: rgba(62, 207, 142, .12);
+  color: var(--green);
+  font-weight: 700;
+}
+.poll-vote-btn:disabled { opacity: .6; cursor: not-allowed; }
+.poll-votes-detail {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}

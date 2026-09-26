@@ -23,6 +23,12 @@
   并实时看到各应答组的提交状态、正文与版本（定向卡仅目标组，全员卡覆盖
   现有全部组）；答复持久化，经快照与 WebSocket 恢复，参与者看不到他组
   正文；重置演练时清空答复并解除锁定
+- 现场决策投票：主持人创建含 2～4 个选项、指定参与组与截止虚拟秒的投票；
+  仅指定组可在截止前提交/改投（每组只计一票）。后台 tick 在状态锁内对
+  到期投票一次性结算：最高票获胜，平票按选项创建顺序决定并持久化；
+  暂停冻结截止计时，重连与重启恢复状态。主持人实时查看逐组选票与汇总，
+  参与者结算前只见自己的选择、结算后才看到结果，观察者完全不可见；
+  重置时未结算投票作废，已结算结果按轮次保留
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -50,6 +56,7 @@ from pydantic import BaseModel, Field
 
 from . import db as dbmod
 from . import export as reviewmod
+from . import polls as pollmod
 
 log = logging.getLogger("inject")
 logging.basicConfig(level=logging.INFO)
@@ -149,6 +156,76 @@ def anchor_public(anchor: sqlite3.Row) -> dict:
         "created_at": anchor["created_at"],
         "updated_at": anchor["updated_at"],
     }
+
+
+# ---------------------------------------------------------------- 现场决策投票
+
+def poll_option_public(option: sqlite3.Row) -> dict:
+    return {"id": option["id"], "seq": option["seq"], "text": option["text"]}
+
+
+def poll_host_view(poll: sqlite3.Row) -> dict:
+    """主持人视野：选项、参与组白名单、逐组选票与选项汇总，全量下发。
+
+    选票明细（哪一组投了哪个选项）只随主持人快照/事件下发；
+    参与者视野走 poll_player_view，观察者完全拿不到投票。
+    """
+    options = pollmod.poll_options(db, poll["id"])
+    group_ids = pollmod.poll_group_ids(db, poll["id"])
+    votes = []
+    tallies = {opt["id"]: 0 for opt in options}
+    for row in db.execute(
+        "SELECT group_id, option_id FROM poll_votes WHERE poll_id = ? ORDER BY group_id",
+        (poll["id"],),
+    ):
+        votes.append({"group_id": row["group_id"], "option_id": row["option_id"]})
+        if row["option_id"] in tallies:
+            tallies[row["option_id"]] += 1
+    return {
+        "id": poll["id"],
+        "question": poll["question"],
+        "round": poll["round"],
+        "deadline_ms": poll["deadline_ms"],
+        "status": poll["status"],               # open | settled | voided
+        "group_ids": group_ids,
+        "options": [poll_option_public(o) for o in options],
+        "votes": votes,                         # 逐组选票：[{group_id, option_id}]
+        "tallies": [
+            {"option_id": opt["id"], "count": tallies[opt["id"]]} for opt in options
+        ],
+        "winner_option_id": poll["winner_option_id"],
+        "settled_at_ms": poll["settled_at_ms"],
+    }
+
+
+def poll_player_view(poll: sqlite3.Row, group_id: int) -> dict:
+    """参与者视野：结算前只见自己的选择（无任何票数/他组信息），
+    结算后才看到获胜选项与选项汇总；作废投票只见作废状态。"""
+    options = pollmod.poll_options(db, poll["id"])
+    data = {
+        "id": poll["id"],
+        "question": poll["question"],
+        "round": poll["round"],
+        "deadline_ms": poll["deadline_ms"],
+        "status": poll["status"],
+        "options": [poll_option_public(o) for o in options],
+        "my_option_id": None,
+    }
+    vote = pollmod.vote_of_group(db, poll["id"], group_id)
+    data["my_option_id"] = vote["option_id"] if vote is not None else None
+    if poll["status"] == "settled":
+        # 结算后结果公开给参与组：获胜选项 + 汇总票数（仍不下发逐组选票明细）
+        tallies = {opt["id"]: 0 for opt in options}
+        for row in db.execute(
+            "SELECT option_id, COUNT(*) AS c FROM poll_votes WHERE poll_id = ? GROUP BY option_id",
+            (poll["id"],),
+        ):
+            if row["option_id"] in tallies:
+                tallies[row["option_id"]] = row["c"]
+        data["winner_option_id"] = poll["winner_option_id"]
+        data["settled_at_ms"] = poll["settled_at_ms"]
+        data["tallies"] = [{"option_id": oid, "count": n} for oid, n in tallies.items()]
+    return data
 
 
 def get_room_or_404(code: str) -> sqlite3.Row:
@@ -395,6 +472,23 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             (room["id"],),
         ).fetchall()
         snapshot["anchors"] = [anchor_public(a) for a in anchors]
+        # 现场决策投票：主持人看到全部轮次的投票（作废/已结算含历史结果）
+        polls = db.execute(
+            "SELECT * FROM polls WHERE room_id = ? ORDER BY round, id", (room["id"],)
+        ).fetchall()
+        snapshot["polls"] = [poll_host_view(p) for p in polls]
+    elif scope is not None:
+        # 参与者：只拿当前轮次、白名单包含本组的投票；
+        # 已结算投票也由此下发（结算后才可见结果），旧轮次投票一律不可见
+        round_idx = current_round(room["id"])
+        polls = db.execute(
+            """SELECT p.* FROM polls p
+               JOIN poll_groups pg ON pg.poll_id = p.id
+               WHERE p.room_id = ? AND p.round = ? AND pg.group_id = ?
+               ORDER BY p.id""",
+            (room["id"], round_idx, scope),
+        ).fetchall()
+        snapshot["polls"] = [poll_player_view(p, scope) for p in polls]
     return snapshot
 
 
@@ -462,27 +556,41 @@ def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
 
 # ---------------------------------------------------------------- 广播
 
+def poll_event_group_ids(payload: dict) -> set[int]:
+    """poll_created / poll_settled 载荷里的参与组白名单（用于按视野过滤）。"""
+    return set(payload.get("group_ids") or [])
+
+
 def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) -> bool:
     """事件是否应投递给该视野。主持人全收；参与者只收全员/本组卡片事件与房间级事件；
     观察者只收已揭示卡片揭示/移除与房间级事件。"""
     if scope is None:
         return True
-    if type_.startswith("share_") or type_ == "gate_updated" or type_.startswith("anchor_"):
-        return False  # 分享凭证、门槛编排、复盘锚点均仅主持人可见
+    if type_.startswith("share_") or type_ == "gate_updated" or type_.startswith("anchor_") \
+            or type_ in ("poll_voided", "poll_settled"):
+        # 分享凭证、门槛编排、复盘锚点、投票作废仅主持人可见；
+        # 投票结算对参与者的推送走 Hub.send_poll_event（按组脱敏载荷），
+        # 通用广播只给主持人，避免把逐组选票全量载荷发给参与者。
+        return False
     if isinstance(scope, ObserverScope):
         if type_ in ("card_revealed", "card_removed", "answer_lock_updated"):
             gid = payload.get("group_id")
             return gid is None or gid in scope.group_ids
         if type_ in ("group_renamed", "group_removed"):
             return payload.get("id") in scope.group_ids
-        if type_ in ("card_added", "group_added", "receipt_updated", "answer_updated"):
-            return False  # 未揭示卡、组加入码、回执明细、答复正文一律不下发
+        if type_ in ("card_added", "group_added", "receipt_updated", "answer_updated",
+                     "poll_created", "poll_vote_updated", "poll_settled"):
+            return False  # 观察者完全不可见：未揭示卡、组加入码、回执、答复、投票
         return True  # clock / reset 等房间级事件
     if type_ in ("card_added", "card_revealed", "card_removed", "answer_lock_updated"):
         gid = payload.get("group_id")
         return gid is None or gid == scope
     if type_ in ("receipt_updated", "answer_updated"):
         return payload.get("group_id") == scope  # 参与者只感知本组的回执/答复变化
+    if type_ == "poll_vote_updated":
+        return payload.get("group_id") == scope  # 改投回执仅同组同步（主持人全收）
+    if type_ in ("poll_created", "poll_settled"):
+        return scope in poll_event_group_ids(payload)  # 仅白名单参与组可见
     if type_ == "group_renamed":
         return payload.get("id") == scope  # 参与者只需感知本组改名
     if type_ in ("group_added", "group_removed"):
@@ -510,11 +618,22 @@ class Hub:
     async def broadcast(self, code: str, message: dict) -> None:
         type_ = message.get("type", "")
         payload = message.get("payload") or {}
+        # 部分事件（投票创建/结算）落库的是主持人全量载荷，参与者需换成
+        # 不含他组信息的脱敏载荷：以下两个私有字段只在本进程内路由，绝不外发。
+        player_payload = message.get("_player_payload")          # 所有参与者通用
+        player_payloads = message.get("_player_payloads") or {}  # 按参与组 id 区分
+        out_base = {k: v for k, v in message.items()
+                    if k not in ("_player_payload", "_player_payloads")}
         for ws, scope in list(self._rooms.get(code, {}).items()):
             if not event_visible(scope, type_, payload):
                 continue
             try:
-                await ws.send_json(message)
+                if isinstance(scope, int) and scope in player_payloads:
+                    await ws.send_json({**out_base, "payload": player_payloads[scope]})
+                elif isinstance(scope, int) and player_payload is not None:
+                    await ws.send_json({**out_base, "payload": player_payload})
+                else:
+                    await ws.send_json(out_base)
             except Exception:
                 self.discard(code, ws)
 
@@ -542,12 +661,40 @@ class Hub:
                 pass
             self.discard(code, ws)
 
+    async def send_poll_event(self, code: str, poll: sqlite3.Row,
+                              event_id: int, type_: str) -> None:
+        """向该投票白名单内在线的参与组连接定向投递其脱敏载荷。
+
+        用于结算事件：主持人已由 publish 收到全量载荷，参与者需收到
+        poll_player_view（本组已投选项 + 获胜结果，不含逐组选票）。
+        """
+        gids = pollmod.poll_group_ids(db, poll["id"])
+        for ws, scope in list(self._rooms.get(code, {}).items()):
+            if not isinstance(scope, int) or scope not in gids:
+                continue
+            try:
+                await ws.send_json({
+                    "kind": "event",
+                    "id": event_id,
+                    "type": type_,
+                    "payload": poll_player_view(poll, scope),
+                    "server_now_ms": now_ms(),
+                })
+            except Exception:
+                self.discard(code, ws)
+
 
 hub = Hub()
 
 
-async def publish(code: str, room_id: int, type_: str, payload: dict) -> int:
-    """落库一条递增事件并按视野广播。必须在 state_lock 下调用。返回新事件 id。"""
+async def publish(code: str, room_id: int, type_: str, payload: dict,
+                  *, player_payload: dict | None = None) -> int:
+    """落库一条递增事件并按视野广播。必须在 state_lock 下调用。返回新事件 id。
+
+    落库与主持人收到的始终是 payload；提供 player_payload 时，参与者连接
+    收到脱敏后的替代载荷（如投票事件：主持人看逐组选票，参与者只看自己的
+    选择/结算结果），事件 id 不变，重连仍以快照为准。
+    """
     cur = db.execute(
         "INSERT INTO events (room_id, type, payload, created_at) VALUES (?, ?, ?, ?)",
         (room_id, type_, json.dumps(payload, ensure_ascii=False), time.time()),
@@ -559,6 +706,7 @@ async def publish(code: str, room_id: int, type_: str, payload: dict) -> int:
         "type": type_,
         "payload": payload,
         "server_now_ms": now_ms(),
+        **({"_player_payload": player_payload} if player_payload is not None else {}),
     })
     return cur.lastrowid
 
@@ -634,6 +782,22 @@ async def ticker_loop() -> None:
                                      room["code"], card["seq"], card["title"])
                         else:
                             log.info("room %s revealed card #%s (%s)", room["code"], card["seq"], card["title"])
+                    # 现场决策投票：对本轮到期投票在同一把锁内一次性结算。
+                    # 暂停时房间不在 running 列表里，截止计时随之冻结；
+                    # settle_due_polls 只取 status='open' 行并写回 settled，
+                    # 每条投票只结算一次，重启后不会重复结算/广播。
+                    round_idx = current_round(room["id"])
+                    for settled in pollmod.settle_due_polls(db, room["id"], round_idx, elapsed):
+                        host_payload = poll_host_view(settled.poll)
+                        event_id = await publish(
+                            room["code"], room["id"], "poll_settled", host_payload)
+                        # 参与者收到的是按组构造的脱敏载荷（本组已投选项 +
+                        # 获胜结果/汇总，不含逐组选票）；主持人已在上一步收到全量。
+                        await hub.send_poll_event(
+                            room["code"], settled.poll, event_id, "poll_settled")
+                        log.info("room %s poll %s settled, winner_option=%s",
+                                 room["code"], settled.poll["id"],
+                                 host_payload["winner_option_id"])
                 await expire_due_shares()
         except asyncio.CancelledError:
             raise
@@ -1149,6 +1313,117 @@ async def delete_anchor(code: str, anchor_id: int):
         return {"ok": True, "id": anchor["id"]}
 
 
+# ---------------------------------------------------------------- REST：现场决策投票
+
+class PollIn(BaseModel):
+    question: str = Field(min_length=1, max_length=200)
+    options: list[str] = Field(min_length=2, max_length=4)  # 2～4 个选项（创建顺序即平票决胜顺序）
+    group_ids: list[int] = Field(min_length=1, max_length=MAX_GROUPS)  # 指定参与组（至少 1 个）
+    deadline_seconds: int = Field(ge=1, le=24 * 3600)      # 截止虚拟秒（相对本轮开始，暂停冻结）
+
+
+class PollVoteIn(BaseModel):
+    option_id: int
+
+
+@app.post("/api/rooms/{code}/polls", status_code=201)
+async def create_poll(code: str, body: PollIn):
+    """主持人创建现场决策投票：2～4 个选项、指定参与组、截止虚拟秒。
+
+    任意房间状态（待机/运行/暂停）可创建；截止以虚拟时钟为准（相对本轮
+    开始），故截止点必须晚于当前虚拟毫秒——已到期点无法投票，直接拒绝。
+    投票归属当前轮次；tick 在状态锁内一次性结算并持久化。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        options = [s.strip()[:200] for s in body.options]
+        if any(not s for s in options):
+            raise HTTPException(status_code=400, detail="选项文本不能为空")
+        if len(set(options)) != len(options):
+            raise HTTPException(status_code=400, detail="选项文本不能重复")
+        group_ids = list(dict.fromkeys(body.group_ids))  # 去重保序
+        for gid in group_ids:
+            get_group_or_404(room["id"], gid)  # 每个指定组都必须属于本房间
+        deadline_ms = body.deadline_seconds * 1000
+        elapsed = room_elapsed_ms(room)
+        if deadline_ms <= elapsed:
+            # 到点即到期：参与者没有任何可投票的虚拟时间窗口
+            raise HTTPException(status_code=400,
+                                detail="截止虚拟秒必须晚于当前虚拟时钟")
+        round_idx = current_round(room["id"])
+        poll = pollmod.create_poll(
+            db, room["id"], body.question.strip(), options, group_ids,
+            deadline_ms, round_idx,
+        )
+        host_payload = poll_host_view(poll)
+        # 参与者通用脱敏载荷：open 状态下不含任何选票信息（每组只见自己的
+        # 选择，由本组连接的快照/改投事件维护），广播按白名单过滤
+        player_payload = {
+            "id": poll["id"],
+            "question": poll["question"],
+            "round": poll["round"],
+            "deadline_ms": poll["deadline_ms"],
+            "status": "open",
+            "group_ids": group_ids,
+            "options": [poll_option_public(o) for o in pollmod.poll_options(db, poll["id"])],
+            "my_option_id": None,
+        }
+        await publish(room["code"], room["id"], "poll_created", host_payload,
+                      player_payload=player_payload)
+        return host_payload
+
+
+@app.put("/api/join/{join_code}/polls/{poll_id}/vote")
+async def cast_poll_vote(join_code: str, poll_id: int, body: PollVoteIn):
+    """参与组提交/改投：每组只计一票（UNIQUE(poll_id, group_id) 原地更新）。
+
+    仅投票白名单内的组、在 open 且虚拟时钟未到截止点时可投；截止后
+    返回 409（等待 tick 一次性结算）。选项不属于本投票返回 404，
+    组不在白名单/投票属于其他房间或旧轮次时按 404 处理，不暴露其存在。
+    """
+    async with state_lock:
+        group = db.execute(
+            "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(status_code=404, detail="join code not found")
+        poll = pollmod.get_poll(db, group["room_id"], poll_id)
+        if poll is None:
+            raise HTTPException(status_code=404, detail="poll not found")
+        # 旧轮次投票（已结算/已作废）对参与者不可见
+        if poll["round"] != current_round(group["room_id"]):
+            raise HTTPException(status_code=404, detail="poll not found")
+        if not db.execute(
+            "SELECT 1 FROM poll_groups WHERE poll_id = ? AND group_id = ?",
+            (poll_id, group["id"]),
+        ).fetchone():
+            raise HTTPException(status_code=404, detail="poll not found")
+        if poll["status"] != "open":
+            raise HTTPException(status_code=409, detail=f"poll is {poll['status']}")
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        if poll["deadline_ms"] <= room_elapsed_ms(room):
+            # 到期到 tick 结算之间的窄窗口：拒绝写入，结果以结算为准
+            raise HTTPException(status_code=409, detail="poll deadline reached")
+        option = db.execute(
+            "SELECT * FROM poll_options WHERE id = ? AND poll_id = ?",
+            (body.option_id, poll_id),
+        ).fetchone()
+        if option is None:
+            raise HTTPException(status_code=404, detail="option not found")
+        result = pollmod.cast_vote(db, poll, group["id"], option["id"])
+        host_poll = db.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()
+        # 主持人收到含逐组选票的完整投票对象；本组参与者只收脱敏三字段
+        # （event_visible 按 group_id 过滤，他组收不到；player_payload 保证
+        # 连本组连接也拿不到含他组选票的 poll 全量对象）
+        await publish(room["code"], room["id"], "poll_vote_updated",
+                      {"poll_id": poll_id, "group_id": group["id"],
+                       "option_id": option["id"], "poll": poll_host_view(host_poll)},
+                      player_payload={"poll_id": poll_id, "group_id": group["id"],
+                                      "option_id": option["id"]})
+        return {"poll_id": result.poll_id, "group_id": result.group_id,
+                "option_id": result.option_id, "changed": not result.first_vote}
+
+
 # ---------------------------------------------------------------- REST：复盘包导出
 
 @app.get("/api/rooms/{code}/review.zip")
@@ -1241,6 +1516,8 @@ async def reset_room(code: str):
     回执随揭示一并收回：未揭示卡片不可回执，新一轮演练从零开始统计；
     门槛超时标记同时清零，门槛回到等待状态；
     处置答复一并清空并解除全部锁定，新一轮演练从零开始作答。
+    现场决策投票：未结算（open）投票一律作废（选票删除、状态置 voided），
+    已结算结果按轮次保留（行内 round 决定归属），作废事件仅主持人可见。
     """
     async with state_lock:
         room = get_room_or_404(code)
@@ -1257,11 +1534,18 @@ async def reset_room(code: str):
         )
         db.execute("DELETE FROM receipts WHERE room_id = ?", (room["id"],))
         db.execute("DELETE FROM answers WHERE room_id = ?", (room["id"],))
+        voided_ids = pollmod.void_open_polls(db, room["id"])
         # 注意：anchors 表不在清理之列——复盘锚点跨重置保留，
         # 并以行内 round 归属原轮次（当前轮次已由本 reset 事件 +1）。
         db.commit()
         payload = {"action": "reset", "status": "idle", "elapsed_ms": 0}
         await publish(room["code"], room["id"], "reset", payload)
+        # 作废事件在 reset 事件之后逐条广播（仅主持人可见）：参与者在收到
+        # reset 时已清空本轮投票，这些投票 round 小于新一轮、快照不再下发。
+        for poll_id in voided_ids:
+            poll = db.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()
+            await publish(room["code"], room["id"], "poll_voided",
+                          {"id": poll_id, "round": poll["round"], "status": "voided"})
         await publish_room_gate_refresh(room)  # 回执已清空，门槛回到等待
         return payload
 
